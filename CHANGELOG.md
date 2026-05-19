@@ -5,6 +5,18 @@ All notable changes to this extension are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-05-19
+
+### Added
+- **Windows / Linux support.** Cloudflared is now discovered via `where` / `which` against `PATH` first, then via OS-specific well-known install locations: `Program Files\cloudflared`, `LOCALAPPDATA\Microsoft\WinGet\Links`, `~\.cloudflared`, `~\scoop\shims` on Windows; `/usr/bin`, `/usr/local/bin`, `~/.local/bin` on Linux (in addition to existing Homebrew paths on macOS).
+- **Distinct red status-bar state** when cloudflared is missing entirely. The local proxy keeps running on `127.0.0.1:<port>` so users with their own tunnel (ngrok, Tailscale Funnel, port forward, …) can still use the extension.
+- **Capped exponential respawn backoff** when cloudflared dies repeatedly (2s → 4s → … → 60s, max 8 attempts). Replaces the previous unconditional 2s respawn loop.
+
+### Changed
+- "cloudflared not found" toast and status-bar tooltip now print the correct install command for the current OS (`brew install cloudflared` / `winget install --id Cloudflare.cloudflared` / cloudflared releases page).
+- README quickstart split per-OS; no more macOS-only assumptions.
+- Cold-start with missing cloudflared no longer tears down the in-process proxy.
+
 ## [0.1.0] - 2026-05-19
 
 First public release.

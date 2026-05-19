@@ -2,7 +2,7 @@
   "name": "cursor-openrouter-proxy",
   "displayName": "Cursor OpenRouter Proxy",
   "description": "OpenAI-compatible local proxy for Cursor that translates Anthropic-shape requests to OpenRouter, preserves 1-hour prompt caching, demotes Cursor's background variants, and exposes itself via a cloudflared quick tunnel — with status-bar cost tracking and one-click copy of the public URL.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "ohadbaehr",
   "author": {
     "name": "Ohad Baehr",
