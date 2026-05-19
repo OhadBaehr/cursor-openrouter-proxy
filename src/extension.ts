@@ -9,6 +9,12 @@ import {
   readTunnelState,
   clearTunnelState,
 } from "./tunnel";
+import {
+  readCostState,
+  writeCostState,
+  clearCostState,
+  CostState,
+} from "./costState";
 
 let outputChannel: vscode.OutputChannel;
 const LOG_FILE = path.join(os.tmpdir(), "cursor-proxy.log");
@@ -17,15 +23,19 @@ let proxy: ProxyServer | null = null;
 let tunnel: Tunnel | null = null;
 let currentUrl: string | null = null;
 let acknowledgedUrl: string | null = null;
-let lastUsage: UsageEvent | null = null;
 let enabled = false;
 let starting = false;
 let ctxRef: vscode.ExtensionContext | null = null;
 
-// Cumulative cost for the active tunnel. Resets only on URL change or stop.
+// Cumulative cost for the active tunnel URL. Cursor's "Override OpenAI Base
+// URL" is a global setting, so this is intentionally shared across every
+// Cursor window via cost.json — the owner writes, every window reads. The
+// local mirrors below are just the latest snapshot from disk.
 let tunnelCostUrl: string | null = null;
 let tunnelCostTotal = 0;
 let tunnelRequestCount = 0;
+let sharedCostPollTimer: NodeJS.Timeout | null = null;
+const SHARED_COST_POLL_MS = 1_500;
 
 const ACK_KEY = "cursorProxy.acknowledgedUrl";
 
@@ -134,35 +144,29 @@ function refreshStatusBar() {
     return;
   }
   const totalStr =
-    !adoptedMode && tunnelRequestCount > 0
-      ? ` · $${formatCost(tunnelCostTotal)}`
-      : "";
-  const modeStr = adoptedMode
-    ? " (shared)"
-    : localOnlyMode
-      ? " (local)"
-      : "";
-  statusBarItem.text = `$(globe) Proxy: on${modeStr}${totalStr}`;
+    tunnelRequestCount > 0 ? ` · $${formatCost(tunnelCostTotal)}` : "";
   const modeNote = adoptedMode
     ? " (shared with another Cursor window)"
     : localOnlyMode
       ? " (local-only, cloudflared disabled)"
       : "";
+  // The cost figure is shared across all windows using this tunnel URL, so
+  // we no longer label adopted windows differently in the status bar — it's
+  // the same number everywhere.
+  statusBarItem.text = `$(globe) Proxy: on${totalStr}`;
+  const shared = readCostState();
+  const sameUrl = shared && shared.url === currentUrl ? shared : null;
+  const lastLine =
+    sameUrl && sameUrl.lastModel
+      ? `Last turn: ${sameUrl.lastModel} cached=${sameUrl.lastCachedPct ?? 0}% cost=$${(sameUrl.lastCost ?? 0).toFixed(4)}`
+      : `No traffic yet.`;
   statusBarItem.tooltip =
     `Cursor proxy on${modeNote}.\n` +
     `Base URL: ${currentUrl}/v1\n` +
-    (adoptedMode
-      ? `This window is attached to the proxy owned by another Cursor window. Usage/cost is tracked there.\n`
-      : localOnlyMode
-        ? `cloudflared spawn is disabled in settings. Use your own tunnel/forwarder, or unset cursorProxy.disableTunnel.\n`
-        : tunnelRequestCount > 0
-          ? `Tunnel total: $${tunnelCostTotal.toFixed(4)} across ${tunnelRequestCount} request${tunnelRequestCount === 1 ? "" : "s"}\n`
-          : "") +
-    (!adoptedMode && lastUsage
-      ? `Last turn: ${lastUsage.model} cached=${pct(lastUsage)}% cost=$${lastUsage.cost.toFixed(4)}`
-      : !adoptedMode
-        ? `No traffic yet.`
-        : ``) +
+    (tunnelRequestCount > 0
+      ? `Tunnel total: $${tunnelCostTotal.toFixed(4)} across ${tunnelRequestCount} request${tunnelRequestCount === 1 ? "" : "s"} (shared across windows)\n`
+      : "") +
+    lastLine +
     `\nClick for actions.`;
   statusBarItem.backgroundColor = undefined;
 }
@@ -171,21 +175,67 @@ function formatCost(c: number): string {
   return c >= 1 ? c.toFixed(2) : c.toFixed(4);
 }
 
-function pct(u: UsageEvent): string {
+function pctFromUsage(u: UsageEvent): number {
   const total = u.input + u.cacheCreate + u.cacheRead;
-  if (total <= 0) return "0";
-  return ((100 * u.cacheRead) / total).toFixed(0);
+  if (total <= 0) return 0;
+  return Math.round((100 * u.cacheRead) / total);
+}
+
+// Pull the shared cost state into the local mirrors used by refreshStatusBar.
+// Returns true if anything changed (so we only repaint on real updates).
+function syncSharedCost(): boolean {
+  if (!currentUrl) return false;
+  const s = readCostState();
+  if (!s || s.url !== currentUrl) {
+    // Either no shared state yet, or it's for a stale URL. Either way, this
+    // window's view of the cost for currentUrl is zero.
+    if (tunnelCostUrl !== currentUrl || tunnelCostTotal !== 0 || tunnelRequestCount !== 0) {
+      tunnelCostUrl = currentUrl;
+      tunnelCostTotal = 0;
+      tunnelRequestCount = 0;
+      return true;
+    }
+    return false;
+  }
+  if (
+    tunnelCostUrl === s.url &&
+    tunnelCostTotal === s.total &&
+    tunnelRequestCount === s.requests
+  ) {
+    return false;
+  }
+  tunnelCostUrl = s.url;
+  tunnelCostTotal = s.total;
+  tunnelRequestCount = s.requests;
+  return true;
+}
+
+function startSharedCostPoll() {
+  if (sharedCostPollTimer) return;
+  sharedCostPollTimer = setInterval(() => {
+    if (!enabled || !currentUrl) return;
+    if (syncSharedCost()) refreshStatusBar();
+  }, SHARED_COST_POLL_MS);
+}
+
+function stopSharedCostPoll() {
+  if (sharedCostPollTimer) {
+    clearInterval(sharedCostPollTimer);
+    sharedCostPollTimer = null;
+  }
 }
 
 function applyUrl(url: string) {
   log(`[tunnel] URL: ${url}`);
+  const prev = tunnelCostUrl;
   currentUrl = url;
-  if (tunnelCostUrl !== url) {
-    if (tunnelCostUrl !== null) {
-      log(
-        `[tunnel] URL changed (${tunnelCostUrl} → ${url}); resetting tunnel cost total`
-      );
+  if (prev !== url) {
+    if (prev !== null) {
+      log(`[tunnel] URL changed (${prev} → ${url}); resetting shared cost total`);
     }
+    // Owner is the only writer; reset shared state so every other window
+    // sees the new URL with a fresh $0 counter.
+    clearCostState();
     tunnelCostUrl = url;
     tunnelCostTotal = 0;
     tunnelRequestCount = 0;
@@ -347,15 +397,16 @@ function pullAdoptedUrl() {
   const s = readTunnelState();
   const next =
     s && s.url && s.port === port ? s.url : `http://127.0.0.1:${port}`;
-  if (next === currentUrl) return;
-  log(`[adopt] picked up URL from owner: ${next}`);
-  currentUrl = next;
-  if (tunnelCostUrl !== next) {
-    tunnelCostUrl = next;
-    tunnelCostTotal = 0;
-    tunnelRequestCount = 0;
+  const urlChanged = next !== currentUrl;
+  if (urlChanged) {
+    log(`[adopt] picked up URL from owner: ${next}`);
+    currentUrl = next;
   }
-  refreshStatusBar();
+  // Cost is sourced from the shared cost.json (the owner is the only writer).
+  // Sync on every poll so the status bar in this window matches every other
+  // window using the same tunnel URL.
+  const costChanged = syncSharedCost();
+  if (urlChanged || costChanged) refreshStatusBar();
 }
 
 function startAdoptedSupervisor(port: number) {
@@ -432,11 +483,30 @@ async function startAll(): Promise<void> {
     });
     log(`[startAll] proxy server listening on 127.0.0.1:${port}`);
     proxy.onUsage((u) => {
-      lastUsage = u;
-      if (currentUrl && tunnelCostUrl === currentUrl) {
-        tunnelCostTotal += u.cost;
-        tunnelRequestCount += 1;
+      // Owner is the sole writer of the shared cost file. Every other window
+      // (including adopted ones) reads it on a poll.
+      if (!currentUrl) {
+        refreshStatusBar();
+        return;
       }
+      const existing = readCostState();
+      const base: CostState =
+        existing && existing.url === currentUrl
+          ? existing
+          : { url: currentUrl, total: 0, requests: 0, updatedAt: Date.now() };
+      const next: CostState = {
+        url: currentUrl,
+        total: base.total + u.cost,
+        requests: base.requests + 1,
+        updatedAt: Date.now(),
+        lastModel: u.model,
+        lastCachedPct: pctFromUsage(u),
+        lastCost: u.cost,
+      };
+      writeCostState(next);
+      tunnelCostUrl = next.url;
+      tunnelCostTotal = next.total;
+      tunnelRequestCount = next.requests;
       refreshStatusBar();
     });
   } catch (e) {
@@ -454,6 +524,7 @@ async function startAll(): Promise<void> {
         starting = false;
         cloudflaredMissing = false;
         startAdoptedSupervisor(port);
+        startSharedCostPoll();
         refreshStatusBar();
         return;
       }
@@ -484,6 +555,8 @@ async function startAll(): Promise<void> {
     // Wipe any leftover cloudflared state from a previous session so adopted
     // windows don't surface a stale public URL that no longer routes here.
     clearTunnelState();
+    clearCostState();
+    startSharedCostPoll();
     log(`[startAll] disableTunnel=true → local-only mode at ${currentUrl}`);
     refreshStatusBar();
     return;
@@ -500,6 +573,7 @@ async function startAll(): Promise<void> {
 
   enabled = true;
   starting = false;
+  startSharedCostPoll();
 
   if (!tunnel.start()) {
     // Local proxy is fine; only the public tunnel is missing. Surface it
@@ -535,6 +609,7 @@ async function stopAll(): Promise<void> {
   // detaches this window's view. Other windows keep using the shared proxy.
   if (adoptedMode) {
     stopAdoptedSupervisor();
+    stopSharedCostPoll();
     adoptedMode = false;
     enabled = false;
     starting = false;
@@ -547,6 +622,7 @@ async function stopAll(): Promise<void> {
     return;
   }
   stopHealthCheck();
+  stopSharedCostPoll();
   if (tunnelRespawnTimer) {
     clearTimeout(tunnelRespawnTimer);
     tunnelRespawnTimer = null;
@@ -555,6 +631,10 @@ async function stopAll(): Promise<void> {
   tunnel = null;
   await proxy?.close();
   proxy = null;
+  // Owner is shutting the whole stack down. Clear the shared cost file so the
+  // next session (or an adopted window taking over) starts at $0 instead of
+  // inheriting a phantom total from a tunnel URL that no longer routes.
+  clearCostState();
   enabled = false;
   starting = false;
   currentUrl = null;
@@ -573,11 +653,16 @@ async function detachAll(): Promise<void> {
   if (adoptedMode) {
     log("[deactivate] adopted mode — only releasing supervisor");
     stopAdoptedSupervisor();
+    stopSharedCostPoll();
     adoptedMode = false;
     return;
   }
   log("[deactivate] detaching tunnel (cloudflared keeps running)");
   stopHealthCheck();
+  stopSharedCostPoll();
+  // NOTE: do NOT clear cost.json here — this is just a window close; the
+  // cloudflared tunnel keeps running, the next activation will adopt it, and
+  // the running total should survive that handover.
   tunnel?.detach();
   tunnel = null;
   await proxy?.close();

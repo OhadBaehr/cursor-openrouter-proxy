@@ -5,6 +5,16 @@ All notable changes to this extension are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-05-19
+
+### Fixed
+- **Cost total is now genuinely shared across all Cursor windows.** Cursor's "Override OpenAI Base URL" is a global setting, so there's exactly one active tunnel URL at any given time — the combined `$` figure now reflects every request that hit it, regardless of which window initiated the chat. Previously the owner window tracked cost in process memory and adopted/shared windows showed `Proxy: on (shared)` with no number.
+- Owner persists running totals to `%TEMP%\cursor-proxy\cost.json` (atomic rename-write); every other window polls that file every 1.5s and renders the same total/tooltip.
+
+### Changed
+- Status bar shows the cost on every window for the active tunnel URL. Dropped the `(shared)` / `(local)` text from the status bar label — they leaked an implementation detail that didn't matter to the user. The tooltip still distinguishes owner vs. shared vs. local-only mode for debugging.
+- When the URL changes (cloudflared restart) or the owner runs Stop Proxy, the shared cost file is cleared so the next URL starts at `$0`.
+
 ## [0.1.3] - 2026-05-19
 
 ### Added
