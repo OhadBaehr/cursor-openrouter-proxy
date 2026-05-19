@@ -33,6 +33,15 @@ let healthTimer: NodeJS.Timeout | null = null;
 let healthFailures = 0;
 let healthInFlight = false;
 
+// Respawn backoff for cloudflared death. Resets on a successful URL, caps so
+// we don't hammer the system if the binary is uninstalled mid-session.
+let cloudflaredMissing = false;
+let tunnelRespawnAttempts = 0;
+const TUNNEL_RESPAWN_BASE_MS = 2_000;
+const TUNNEL_RESPAWN_MAX_MS = 60_000;
+const TUNNEL_RESPAWN_MAX_ATTEMPTS = 8;
+let tunnelRespawnTimer: NodeJS.Timeout | null = null;
+
 function log(line: string) {
   const ts = new Date().toISOString().split("T")[1].slice(0, 12);
   const msg = `${ts} ${line}`;
@@ -67,6 +76,17 @@ function refreshStatusBar() {
     return;
   }
   if (!currentUrl) {
+    if (cloudflaredMissing) {
+      statusBarItem.text = "$(error) Proxy: cloudflared missing";
+      statusBarItem.tooltip =
+        `cloudflared binary not found on PATH or known install locations.\n` +
+        `Install it (${cloudflaredInstallHint()}), then click → Refresh Tunnel URL.\n` +
+        `The local proxy is still listening on 127.0.0.1; you can use it directly if you don't need the public tunnel.`;
+      statusBarItem.backgroundColor = new vscode.ThemeColor(
+        "statusBarItem.errorBackground"
+      );
+      return;
+    }
     statusBarItem.text = "$(alert) Proxy: tunnel down";
     statusBarItem.tooltip =
       "Cloudflared tunnel is not running.\nClick for actions.";
@@ -125,9 +145,60 @@ function applyUrl(url: string) {
     tunnelCostTotal = 0;
     tunnelRequestCount = 0;
   }
+  // A working URL clears all error states.
   healthFailures = 0;
+  cloudflaredMissing = false;
+  tunnelRespawnAttempts = 0;
+  if (tunnelRespawnTimer) {
+    clearTimeout(tunnelRespawnTimer);
+    tunnelRespawnTimer = null;
+  }
   refreshStatusBar();
   startHealthCheck();
+}
+
+function scheduleTunnelRespawn() {
+  if (!enabled || !tunnel) return;
+  if (tunnelRespawnTimer) return;
+
+  tunnelRespawnAttempts += 1;
+  if (tunnelRespawnAttempts > TUNNEL_RESPAWN_MAX_ATTEMPTS) {
+    cloudflaredMissing = true;
+    log(
+      `[tunnel] giving up after ${TUNNEL_RESPAWN_MAX_ATTEMPTS} respawn attempts; ` +
+        `surfacing 'cloudflared missing' state. Click Refresh Tunnel URL to retry.`
+    );
+    refreshStatusBar();
+    return;
+  }
+
+  const delay = Math.min(
+    TUNNEL_RESPAWN_BASE_MS * 2 ** (tunnelRespawnAttempts - 1),
+    TUNNEL_RESPAWN_MAX_MS
+  );
+  log(
+    `[tunnel] respawn attempt ${tunnelRespawnAttempts}/${TUNNEL_RESPAWN_MAX_ATTEMPTS} in ${delay}ms`
+  );
+  tunnelRespawnTimer = setTimeout(() => {
+    tunnelRespawnTimer = null;
+    if (!enabled || !tunnel) return;
+    const ok = tunnel.start();
+    if (!ok) {
+      // Couldn't even spawn — binary is gone. Mark missing and stop retrying.
+      cloudflaredMissing = true;
+      log("[tunnel] respawn failed: cloudflared binary not found");
+      refreshStatusBar();
+    }
+  }, delay);
+}
+
+function handleTunnelExit() {
+  if (!enabled || !tunnel) return;
+  log("[tunnel] cloudflared died");
+  currentUrl = null;
+  stopHealthCheck();
+  refreshStatusBar();
+  scheduleTunnelRespawn();
 }
 
 function startHealthCheck() {
@@ -247,33 +318,27 @@ async function startAll(): Promise<void> {
     port,
     log,
     onUrl: (url) => applyUrl(url),
-    onExit: () => {
-      if (!enabled || !tunnel) return;
-      log("[tunnel] cloudflared died");
-      currentUrl = null;
-      stopHealthCheck();
-      refreshStatusBar();
-      log("[tunnel] respawning in 2s…");
-      setTimeout(() => {
-        if (enabled && tunnel) tunnel.start();
-      }, 2000);
-    },
+    onExit: handleTunnelExit,
   });
+
+  enabled = true;
+  starting = false;
+
   if (!tunnel.start()) {
-    log("[startAll] tunnel.start() returned false (cloudflared missing?)");
-    vscode.window.showErrorMessage(
-      `Cursor proxy: cloudflared not found. Install: ${cloudflaredInstallHint()}`
+    // Local proxy is fine; only the public tunnel is missing. Surface it
+    // clearly without killing the in-process server — users with a different
+    // tunnel solution (e.g. ngrok, Tailscale Funnel) can still hit
+    // 127.0.0.1:<port> directly.
+    cloudflaredMissing = true;
+    log(`[startAll] cloudflared not found. Install: ${cloudflaredInstallHint()}`);
+    vscode.window.showWarningMessage(
+      `Cursor proxy is running locally on 127.0.0.1:${port}, but cloudflared was not found. ` +
+        `Install it to get a public URL: ${cloudflaredInstallHint()}`
     );
-    await proxy?.close();
-    proxy = null;
-    tunnel = null;
-    starting = false;
     refreshStatusBar();
     return;
   }
   log("[startAll] cloudflared spawned; waiting for URL…");
-  enabled = true;
-  starting = false;
   refreshStatusBar();
 }
 
@@ -281,6 +346,10 @@ async function stopAll(): Promise<void> {
   if (!enabled && !starting) return;
   log("[proxy] disabling…");
   stopHealthCheck();
+  if (tunnelRespawnTimer) {
+    clearTimeout(tunnelRespawnTimer);
+    tunnelRespawnTimer = null;
+  }
   tunnel?.stop();
   tunnel = null;
   await proxy?.close();
@@ -291,6 +360,8 @@ async function stopAll(): Promise<void> {
   tunnelCostUrl = null;
   tunnelCostTotal = 0;
   tunnelRequestCount = 0;
+  cloudflaredMissing = false;
+  tunnelRespawnAttempts = 0;
   refreshStatusBar();
 }
 
@@ -419,6 +490,14 @@ async function refresh() {
   stopHealthCheck();
   tunnel.stop();
   currentUrl = null;
+  // Manual refresh = user intent; clear any "give up" state and reset
+  // backoff so we'll actually retry promptly.
+  cloudflaredMissing = false;
+  tunnelRespawnAttempts = 0;
+  if (tunnelRespawnTimer) {
+    clearTimeout(tunnelRespawnTimer);
+    tunnelRespawnTimer = null;
+  }
   refreshStatusBar();
   // let SIGTERM land before respawn
   await new Promise((r) => setTimeout(r, 500));
@@ -426,19 +505,16 @@ async function refresh() {
     port: proxy!.port,
     log,
     onUrl: (url) => applyUrl(url),
-    onExit: () => {
-      if (!enabled || !tunnel) return;
-      log("[tunnel] cloudflared died");
-      currentUrl = null;
-      stopHealthCheck();
-      refreshStatusBar();
-      log("[tunnel] respawning in 2s…");
-      setTimeout(() => {
-        if (enabled && tunnel) tunnel.start();
-      }, 2000);
-    },
+    onExit: handleTunnelExit,
   });
-  tunnel.start();
+  if (!tunnel.start()) {
+    cloudflaredMissing = true;
+    log(`[refresh] cloudflared not found. Install: ${cloudflaredInstallHint()}`);
+    vscode.window.showWarningMessage(
+      `cloudflared not found. Install: ${cloudflaredInstallHint()}`
+    );
+    refreshStatusBar();
+  }
 }
 
 // Sweep state left behind by a pre-release pinner daemon, in case anyone
