@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,15 +7,51 @@ import * as path from "node:path";
 // extension-host reloads (`detached` + `unref`) and persist {pid,url,port}
 // to disk; the next activation adopts the running process.
 
-const CLOUDFLARED_CANDIDATES = [
-  "/opt/homebrew/bin/cloudflared",
-  "/usr/local/bin/cloudflared",
-  `${process.env.HOME ?? ""}/.local/bin/cloudflared`,
-];
+const IS_WINDOWS = process.platform === "win32";
+const HOME = process.env.HOME ?? process.env.USERPROFILE ?? "";
+
+// Common install locations on macOS / Linux / Windows. Order matters: PATH
+// lookup is the most reliable (handled separately below), and these candidates
+// are only the well-known fallbacks for installs that don't update PATH.
+function cloudflaredCandidates(): string[] {
+  if (IS_WINDOWS) {
+    const localAppData = process.env.LOCALAPPDATA ?? "";
+    const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+    const programFilesX86 =
+      process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
+    return [
+      path.join(programFiles, "cloudflared", "cloudflared.exe"),
+      path.join(programFilesX86, "cloudflared", "cloudflared.exe"),
+      path.join(
+        localAppData,
+        "Microsoft",
+        "WinGet",
+        "Links",
+        "cloudflared.exe"
+      ),
+      path.join(HOME, ".cloudflared", "cloudflared.exe"),
+      path.join(HOME, "scoop", "shims", "cloudflared.exe"),
+    ];
+  }
+  return [
+    "/opt/homebrew/bin/cloudflared", // macOS Homebrew (Apple Silicon)
+    "/usr/local/bin/cloudflared", // macOS Homebrew (Intel) / Linux manual
+    "/usr/bin/cloudflared", // Linux package managers
+    path.join(HOME, ".local/bin/cloudflared"),
+  ];
+}
 
 const STATE_DIR = path.join(os.tmpdir(), "cursor-proxy");
 const STATE_FILE = path.join(STATE_DIR, "tunnel.json");
 const TUNNEL_LOG = path.join(STATE_DIR, "cloudflared.log");
+
+// Suggest the install command for the current OS in the error message we
+// surface when cloudflared isn't on the system.
+export function cloudflaredInstallHint(): string {
+  if (IS_WINDOWS) return "winget install --id Cloudflare.cloudflared";
+  if (process.platform === "darwin") return "brew install cloudflared";
+  return "see https://github.com/cloudflare/cloudflared/releases or your distro's package manager";
+}
 
 interface State {
   pid: number;
@@ -25,10 +61,32 @@ interface State {
 }
 
 function findCloudflared(): string | null {
-  for (const p of CLOUDFLARED_CANDIDATES) {
+  // 1. PATH lookup via the OS's own command-finder. This catches whatever the
+  // user actually installed (Homebrew, winget, scoop, apt, manual unzip, …)
+  // without us hard-coding paths.
+  try {
+    const finder = IS_WINDOWS ? "where" : "which";
+    const arg = IS_WINDOWS ? "cloudflared.exe" : "cloudflared";
+    const out = execFileSync(finder, [arg], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const first = out.split(/\r?\n/).map((s) => s.trim()).find((s) => s);
+    if (first && fs.existsSync(first)) return first;
+  } catch {
+    /* not on PATH; fall through to well-known locations */
+  }
+
+  // 2. Well-known install locations for the current OS. X_OK doesn't apply
+  // on Windows (NTFS has no exec bit), so just check existence there.
+  for (const p of cloudflaredCandidates()) {
     try {
-      fs.accessSync(p, fs.constants.X_OK);
-      return p;
+      if (IS_WINDOWS) {
+        if (fs.existsSync(p)) return p;
+      } else {
+        fs.accessSync(p, fs.constants.X_OK);
+        return p;
+      }
     } catch {
       /* try next */
     }
@@ -126,7 +184,7 @@ export class Tunnel {
     const bin = findCloudflared();
     if (!bin) {
       this.opts.log(
-        "[tunnel] cloudflared not found. Install: brew install cloudflared"
+        `[tunnel] cloudflared not found. Install: ${cloudflaredInstallHint()}`
       );
       return false;
     }

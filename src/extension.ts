@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { startProxyServer, ProxyServer, UsageEvent } from "./proxyServer";
-import { Tunnel } from "./tunnel";
+import { Tunnel, cloudflaredInstallHint } from "./tunnel";
 
 let outputChannel: vscode.OutputChannel;
 const LOG_FILE = path.join(os.tmpdir(), "cursor-proxy.log");
@@ -262,7 +262,7 @@ async function startAll(): Promise<void> {
   if (!tunnel.start()) {
     log("[startAll] tunnel.start() returned false (cloudflared missing?)");
     vscode.window.showErrorMessage(
-      "Cursor proxy: cloudflared not found. Install via `brew install cloudflared`."
+      `Cursor proxy: cloudflared not found. Install: ${cloudflaredInstallHint()}`
     );
     await proxy?.close();
     proxy = null;
