@@ -5,6 +5,27 @@ All notable changes to this extension are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-05-19
+
+### Added
+- **`cursorProxy.disableTunnel`** (boolean, default `false`) — skip cloudflared entirely. The proxy still serves on `127.0.0.1:<port>` for use with your own tunnel/forwarder (ngrok, Tailscale Funnel, port-forward, etc.). Status bar shows `Proxy: on (local)` in this mode.
+- **`cursorProxy.cloudflaredPath`** (string, default empty) — explicit absolute path to the cloudflared binary. When set, discovery via `PATH` and well-known install locations is skipped; an invalid path now surfaces a clear warning instead of silently falling back.
+- **`Cursor Proxy: Open Settings`** command + status-bar menu entry — opens Settings filtered to this extension, so port and other knobs are one click away instead of buried in the global Settings UI.
+- **Live config reload.** Changing `port`, `disableTunnel`, or `cloudflaredPath` while the proxy is running now prompts to restart the proxy instead of being silently ignored until the window reloads.
+
+### Fixed
+- Adopted (shared) windows correctly fall back to the local URL when the owner is in `disableTunnel` mode, instead of showing stale `trycloudflare.com` URLs left over from a previous session.
+- Owner now wipes stale cloudflared state (`tunnel.json`) when starting in local-only mode.
+
+## [0.1.2] - 2026-05-19
+
+### Fixed
+- **Multi-window crash on Windows / EADDRINUSE.** Opening a second Cursor window used to fail with `listen EADDRINUSE: address already in use 127.0.0.1:9000` because each extension host tried to bind its own proxy server. The first window now becomes the **owner** (runs the proxy + cloudflared); subsequent windows detect the bound port, probe `/health`, and attach in **adopted** mode — they share the same public URL via the existing tunnel state file and surface a `Proxy: on (shared)` status. If the owner window closes, an adopted window automatically takes over the next time `/health` fails (capped at 2 consecutive failures, ~10s).
+- Adopted windows hide owner-only menu actions (refresh / restart) and rebrand "Stop Proxy" as "Detach", so stopping in a viewer window doesn't accidentally kill the tunnel for the owner.
+
+### Changed
+- Log lines now include `pid=` so interleaved entries from multiple Cursor windows in the shared `cursor-proxy.log` file are attributable to a specific extension host.
+
 ## [0.1.1] - 2026-05-19
 
 ### Added

@@ -60,7 +60,25 @@ interface State {
   startedAt: number;
 }
 
-function findCloudflared(): string | null {
+function findCloudflared(override?: string): string | null {
+  // 0. Explicit user-configured override wins. Fail loudly (return null) if
+  // it doesn't exist instead of silently falling back — the user explicitly
+  // pointed us at a path and we should respect that intent.
+  if (override && override.trim()) {
+    const p = override.trim();
+    try {
+      if (IS_WINDOWS) {
+        if (fs.existsSync(p)) return p;
+      } else {
+        fs.accessSync(p, fs.constants.X_OK);
+        return p;
+      }
+    } catch {
+      /* fall through to null below */
+    }
+    return null;
+  }
+
   // 1. PATH lookup via the OS's own command-finder. This catches whatever the
   // user actually installed (Homebrew, winget, scoop, apt, manual unzip, …)
   // without us hard-coding paths.
@@ -104,6 +122,19 @@ function processAlive(pid: number): boolean {
   }
 }
 
+// Public read-only view of the tunnel state file. Used by adopted (non-owner)
+// extension hosts to surface the current URL without spawning their own
+// cloudflared.
+export function readTunnelState(): State | null {
+  return readState();
+}
+
+// Public hook so the owner can wipe stale tunnel state (e.g. when starting in
+// local-only mode after a previous session left a cloudflared URL behind).
+export function clearTunnelState(): void {
+  clearState();
+}
+
 function readState(): State | null {
   try {
     const raw = fs.readFileSync(STATE_FILE, "utf8");
@@ -143,6 +174,8 @@ export interface TunnelOptions {
   log: (line: string) => void;
   onUrl: (url: string) => void;
   onExit: () => void;
+  // Optional explicit cloudflared binary path. If set, discovery is skipped.
+  cloudflaredPath?: string;
 }
 
 export class Tunnel {
@@ -181,11 +214,17 @@ export class Tunnel {
       clearState();
     }
 
-    const bin = findCloudflared();
+    const bin = findCloudflared(this.opts.cloudflaredPath);
     if (!bin) {
-      this.opts.log(
-        `[tunnel] cloudflared not found. Install: ${cloudflaredInstallHint()}`
-      );
+      if (this.opts.cloudflaredPath && this.opts.cloudflaredPath.trim()) {
+        this.opts.log(
+          `[tunnel] configured cloudflaredPath does not exist or is not executable: ${this.opts.cloudflaredPath}`
+        );
+      } else {
+        this.opts.log(
+          `[tunnel] cloudflared not found. Install: ${cloudflaredInstallHint()}`
+        );
+      }
       return false;
     }
 

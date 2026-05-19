@@ -3,7 +3,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { startProxyServer, ProxyServer, UsageEvent } from "./proxyServer";
-import { Tunnel, cloudflaredInstallHint } from "./tunnel";
+import {
+  Tunnel,
+  cloudflaredInstallHint,
+  readTunnelState,
+  clearTunnelState,
+} from "./tunnel";
 
 let outputChannel: vscode.OutputChannel;
 const LOG_FILE = path.join(os.tmpdir(), "cursor-proxy.log");
@@ -42,9 +47,31 @@ const TUNNEL_RESPAWN_MAX_MS = 60_000;
 const TUNNEL_RESPAWN_MAX_ATTEMPTS = 8;
 let tunnelRespawnTimer: NodeJS.Timeout | null = null;
 
+// Local-only mode: cloudflared is intentionally disabled by config. We still
+// run the proxy server on 127.0.0.1:<port>; the user is expected to put their
+// own tunnel/forwarder in front of it (or use it locally on the same machine).
+let localOnlyMode = false;
+
+// Multi-window coordination. Each Cursor window runs its own extension host;
+// only one can bind 127.0.0.1:<port>. The first one wins and becomes the
+// "owner" (runs proxy server + cloudflared). Subsequent windows detect the
+// already-bound port, probe /health to confirm it's our proxy, and attach in
+// "adopted" mode: surface the same URL via the shared tunnel state file but
+// don't try to bind anything. If the owner dies, the next /health failure
+// triggers a takeover attempt.
+let adoptedMode = false;
+let adoptedTimer: NodeJS.Timeout | null = null;
+let adoptedFailures = 0;
+const ADOPT_PROBE_TIMEOUT_MS = 2_000;
+const ADOPT_POLL_MS = 5_000;
+const ADOPT_TAKEOVER_FAILS = 2;
+
 function log(line: string) {
   const ts = new Date().toISOString().split("T")[1].slice(0, 12);
-  const msg = `${ts} ${line}`;
+  // pid prefix matters: multiple Cursor windows append to the same log file,
+  // so without it adopted-mode logs interleave with the owner's and you can't
+  // tell which window did what.
+  const msg = `${ts} pid=${process.pid} ${line}`;
   outputChannel.appendLine(msg);
   try {
     fs.appendFileSync(LOG_FILE, msg + "\n");
@@ -107,18 +134,36 @@ function refreshStatusBar() {
     return;
   }
   const totalStr =
-    tunnelRequestCount > 0 ? ` · $${formatCost(tunnelCostTotal)}` : "";
-  statusBarItem.text = `$(globe) Proxy: on${totalStr}`;
+    !adoptedMode && tunnelRequestCount > 0
+      ? ` · $${formatCost(tunnelCostTotal)}`
+      : "";
+  const modeStr = adoptedMode
+    ? " (shared)"
+    : localOnlyMode
+      ? " (local)"
+      : "";
+  statusBarItem.text = `$(globe) Proxy: on${modeStr}${totalStr}`;
+  const modeNote = adoptedMode
+    ? " (shared with another Cursor window)"
+    : localOnlyMode
+      ? " (local-only, cloudflared disabled)"
+      : "";
   statusBarItem.tooltip =
-    `Cursor proxy on.\n` +
+    `Cursor proxy on${modeNote}.\n` +
     `Base URL: ${currentUrl}/v1\n` +
-    (tunnelRequestCount > 0
-      ? `Tunnel total: $${tunnelCostTotal.toFixed(4)} across ${tunnelRequestCount} request${tunnelRequestCount === 1 ? "" : "s"}\n`
-      : "") +
-    (lastUsage
+    (adoptedMode
+      ? `This window is attached to the proxy owned by another Cursor window. Usage/cost is tracked there.\n`
+      : localOnlyMode
+        ? `cloudflared spawn is disabled in settings. Use your own tunnel/forwarder, or unset cursorProxy.disableTunnel.\n`
+        : tunnelRequestCount > 0
+          ? `Tunnel total: $${tunnelCostTotal.toFixed(4)} across ${tunnelRequestCount} request${tunnelRequestCount === 1 ? "" : "s"}\n`
+          : "") +
+    (!adoptedMode && lastUsage
       ? `Last turn: ${lastUsage.model} cached=${pct(lastUsage)}% cost=$${lastUsage.cost.toFixed(4)}`
-      : `No traffic yet.`) +
-    `\nClick for actions (copy URL, refresh, stop, logs).`;
+      : !adoptedMode
+        ? `No traffic yet.`
+        : ``) +
+    `\nClick for actions.`;
   statusBarItem.backgroundColor = undefined;
 }
 
@@ -269,6 +314,97 @@ async function runHealthProbe(reason: string): Promise<void> {
   );
 }
 
+async function probeLocalHealth(
+  port: number,
+  timeoutMs: number
+): Promise<boolean> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/health`, {
+      signal: ctrl.signal,
+      headers: { "User-Agent": "cursor-proxy-adoption-probe/1" },
+    });
+    if (!res.ok) return false;
+    const txt = await res.text();
+    // Match our /health response specifically — refuse to adopt some random
+    // other server happening to listen on the same port.
+    return txt.includes('"status":"ok"');
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function pullAdoptedUrl() {
+  const cfg = vscode.workspace.getConfiguration("cursorProxy");
+  const port = cfg.get<number>("port", 9000);
+  // Prefer the public cloudflared URL if the owner has one; otherwise the
+  // owner is in local-only mode (or hasn't gotten a tunnel URL yet) and the
+  // local URL is the right thing to surface — we already proved /health is
+  // reachable on it during adoption.
+  const s = readTunnelState();
+  const next =
+    s && s.url && s.port === port ? s.url : `http://127.0.0.1:${port}`;
+  if (next === currentUrl) return;
+  log(`[adopt] picked up URL from owner: ${next}`);
+  currentUrl = next;
+  if (tunnelCostUrl !== next) {
+    tunnelCostUrl = next;
+    tunnelCostTotal = 0;
+    tunnelRequestCount = 0;
+  }
+  refreshStatusBar();
+}
+
+function startAdoptedSupervisor(port: number) {
+  stopAdoptedSupervisor();
+  adoptedFailures = 0;
+  pullAdoptedUrl();
+  adoptedTimer = setInterval(() => {
+    if (!adoptedMode) {
+      stopAdoptedSupervisor();
+      return;
+    }
+    void (async () => {
+      const ok = await probeLocalHealth(port, ADOPT_PROBE_TIMEOUT_MS);
+      if (ok) {
+        adoptedFailures = 0;
+        pullAdoptedUrl();
+        return;
+      }
+      adoptedFailures += 1;
+      log(
+        `[adopt] owner /health failed ${adoptedFailures}/${ADOPT_TAKEOVER_FAILS}`
+      );
+      if (adoptedFailures < ADOPT_TAKEOVER_FAILS) return;
+
+      log("[adopt] owner appears dead — releasing and attempting takeover");
+      stopAdoptedSupervisor();
+      adoptedMode = false;
+      adoptedFailures = 0;
+      enabled = false;
+      starting = false;
+      currentUrl = null;
+      refreshStatusBar();
+      try {
+        await startAll();
+      } catch (e) {
+        log(`[adopt] takeover startAll threw: ${(e as Error).message}`);
+      }
+    })();
+  }, ADOPT_POLL_MS);
+}
+
+function stopAdoptedSupervisor() {
+  if (adoptedTimer) {
+    clearInterval(adoptedTimer);
+    adoptedTimer = null;
+  }
+  adoptedFailures = 0;
+}
+
 async function startAll(): Promise<void> {
   if (enabled || starting) {
     log(`[startAll] skipped: enabled=${enabled} starting=${starting}`);
@@ -305,6 +441,26 @@ async function startAll(): Promise<void> {
     });
   } catch (e) {
     const msg = (e as Error).message;
+    // EADDRINUSE almost always means another Cursor window already owns the
+    // proxy on this machine. Probe /health: if it answers like ours, attach
+    // in adopted mode so this window shares the URL instead of erroring out.
+    if (/EADDRINUSE/i.test(msg)) {
+      log(`[startAll] port ${port} busy; probing for an existing cursor proxy`);
+      const adopted = await probeLocalHealth(port, ADOPT_PROBE_TIMEOUT_MS);
+      if (adopted) {
+        log(`[startAll] adopted existing proxy on 127.0.0.1:${port}`);
+        adoptedMode = true;
+        enabled = true;
+        starting = false;
+        cloudflaredMissing = false;
+        startAdoptedSupervisor(port);
+        refreshStatusBar();
+        return;
+      }
+      log(
+        `[startAll] port ${port} busy but /health didn't answer like ours — refusing to adopt`
+      );
+    }
     log(`[proxy] failed to start: ${msg}`);
     vscode.window.showErrorMessage(
       `Cursor proxy: could not bind 127.0.0.1:${port}. ${msg}`
@@ -314,11 +470,32 @@ async function startAll(): Promise<void> {
     return;
   }
 
+  // Honour `disableTunnel`: skip cloudflared entirely. Surface the local URL
+  // as the canonical one so "Copy URL" still works for users with their own
+  // tunnel solution.
+  if (cfg.get<boolean>("disableTunnel", false)) {
+    localOnlyMode = true;
+    enabled = true;
+    starting = false;
+    currentUrl = `http://127.0.0.1:${port}`;
+    tunnelCostUrl = currentUrl;
+    tunnelCostTotal = 0;
+    tunnelRequestCount = 0;
+    // Wipe any leftover cloudflared state from a previous session so adopted
+    // windows don't surface a stale public URL that no longer routes here.
+    clearTunnelState();
+    log(`[startAll] disableTunnel=true → local-only mode at ${currentUrl}`);
+    refreshStatusBar();
+    return;
+  }
+  localOnlyMode = false;
+
   tunnel = new Tunnel({
     port,
     log,
     onUrl: (url) => applyUrl(url),
     onExit: handleTunnelExit,
+    cloudflaredPath: cfg.get<string>("cloudflaredPath", ""),
   });
 
   enabled = true;
@@ -330,11 +507,20 @@ async function startAll(): Promise<void> {
     // tunnel solution (e.g. ngrok, Tailscale Funnel) can still hit
     // 127.0.0.1:<port> directly.
     cloudflaredMissing = true;
-    log(`[startAll] cloudflared not found. Install: ${cloudflaredInstallHint()}`);
-    vscode.window.showWarningMessage(
-      `Cursor proxy is running locally on 127.0.0.1:${port}, but cloudflared was not found. ` +
-        `Install it to get a public URL: ${cloudflaredInstallHint()}`
-    );
+    const customPath = cfg.get<string>("cloudflaredPath", "").trim();
+    if (customPath) {
+      log(`[startAll] configured cloudflaredPath invalid: ${customPath}`);
+      vscode.window.showWarningMessage(
+        `Cursor proxy: configured cloudflaredPath does not exist or is not executable: ${customPath}. ` +
+          `The local proxy is still running on 127.0.0.1:${port}.`
+      );
+    } else {
+      log(`[startAll] cloudflared not found. Install: ${cloudflaredInstallHint()}`);
+      vscode.window.showWarningMessage(
+        `Cursor proxy is running locally on 127.0.0.1:${port}, but cloudflared was not found. ` +
+          `Install it to get a public URL: ${cloudflaredInstallHint()}`
+      );
+    }
     refreshStatusBar();
     return;
   }
@@ -345,6 +531,21 @@ async function startAll(): Promise<void> {
 async function stopAll(): Promise<void> {
   if (!enabled && !starting) return;
   log("[proxy] disabling…");
+  // Adopted windows don't own the server or the tunnel; "stop" here just
+  // detaches this window's view. Other windows keep using the shared proxy.
+  if (adoptedMode) {
+    stopAdoptedSupervisor();
+    adoptedMode = false;
+    enabled = false;
+    starting = false;
+    currentUrl = null;
+    tunnelCostUrl = null;
+    tunnelCostTotal = 0;
+    tunnelRequestCount = 0;
+    refreshStatusBar();
+    log("[proxy] detached from shared proxy (other windows still own it)");
+    return;
+  }
   stopHealthCheck();
   if (tunnelRespawnTimer) {
     clearTimeout(tunnelRespawnTimer);
@@ -361,6 +562,7 @@ async function stopAll(): Promise<void> {
   tunnelCostTotal = 0;
   tunnelRequestCount = 0;
   cloudflaredMissing = false;
+  localOnlyMode = false;
   tunnelRespawnAttempts = 0;
   refreshStatusBar();
 }
@@ -368,6 +570,12 @@ async function stopAll(): Promise<void> {
 // Release handles without killing cloudflared, so the next activation can
 // adopt the same tunnel and the URL doesn't rotate on every reload.
 async function detachAll(): Promise<void> {
+  if (adoptedMode) {
+    log("[deactivate] adopted mode — only releasing supervisor");
+    stopAdoptedSupervisor();
+    adoptedMode = false;
+    return;
+  }
   log("[deactivate] detaching tunnel (cloudflared keeps running)");
   stopHealthCheck();
   tunnel?.detach();
@@ -434,14 +642,14 @@ async function showMenu() {
       label: `$(clippy) Copy URL & Open Models Settings${isNew ? " (new URL)" : ""}`,
       description: `${currentUrl}/v1`,
     });
-  } else {
+  } else if (!adoptedMode) {
     items.push({
       id: "refresh",
       label: "$(refresh) Restart Tunnel",
       description: "Cloudflared is not running",
     });
   }
-  if (currentUrl) {
+  if (currentUrl && !adoptedMode && !localOnlyMode) {
     items.push({
       id: "refresh",
       label: "$(refresh) Refresh Tunnel URL",
@@ -449,12 +657,19 @@ async function showMenu() {
     });
   }
   items.push({
+    id: "configure",
+    label: "$(gear) Open Settings",
+    description: "Port, model fallback, tunnel options, attribution",
+  });
+  items.push({
     id: "showLogs",
     label: "$(output) Show Logs",
   });
   items.push({
     id: "stop",
-    label: "$(circle-slash) Stop Proxy",
+    label: adoptedMode
+      ? "$(debug-disconnect) Detach (other windows keep proxy running)"
+      : "$(circle-slash) Stop Proxy",
   });
 
   const placeHolder = starting
@@ -472,6 +687,9 @@ async function showMenu() {
     case "refresh":
       await refresh();
       break;
+    case "configure":
+      await openSettings();
+      break;
     case "showLogs":
       outputChannel.show();
       break;
@@ -481,7 +699,36 @@ async function showMenu() {
   }
 }
 
+async function openSettings() {
+  // VS Code's openSettings command accepts a search query that scopes the UI
+  // to a specific extension's contributed settings via `@ext:<publisher>.<id>`.
+  try {
+    await vscode.commands.executeCommand(
+      "workbench.action.openSettings",
+      "@ext:ohadbaehr.cursor-openrouter-proxy"
+    );
+  } catch (e) {
+    log(`[settings] open via @ext failed: ${(e as Error).message}`);
+    try {
+      await vscode.commands.executeCommand(
+        "workbench.action.openSettings",
+        "cursorProxy"
+      );
+    } catch {
+      /* last-ditch best-effort */
+    }
+  }
+}
+
 async function refresh() {
+  if (adoptedMode) {
+    log("[refresh] ignored: this window is adopted; owner controls the tunnel");
+    vscode.window.showInformationMessage(
+      "Cursor proxy: this window is sharing the tunnel from another Cursor window. " +
+        "Refresh from the window that owns the proxy."
+    );
+    return;
+  }
   if (!enabled || !tunnel) {
     await startAll();
     return;
@@ -612,6 +859,33 @@ export async function activate(ctx: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand("cursorProxy.showLogs", () => {
       outputChannel.show();
+    }),
+    vscode.commands.registerCommand("cursorProxy.configure", openSettings)
+  );
+
+  // Live config reload. Settings that affect the running server (port,
+  // disableTunnel, cloudflaredPath) require a restart of the proxy to take
+  // effect. Offer it instead of silently ignoring the change.
+  ctx.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(async (e) => {
+      if (!e.affectsConfiguration("cursorProxy")) return;
+      const restartKeys = [
+        "cursorProxy.port",
+        "cursorProxy.disableTunnel",
+        "cursorProxy.cloudflaredPath",
+      ];
+      const needsRestart = restartKeys.some((k) => e.affectsConfiguration(k));
+      if (!needsRestart) return;
+      if (!enabled && !starting) return;
+      log("[config] proxy-affecting setting changed; offering restart");
+      const choice = await vscode.window.showInformationMessage(
+        "Cursor Proxy: a setting that affects the running proxy was changed. Restart now?",
+        "Restart",
+        "Later"
+      );
+      if (choice !== "Restart") return;
+      await stopAll();
+      await startAll();
     })
   );
 

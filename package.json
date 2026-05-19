@@ -2,7 +2,7 @@
   "name": "cursor-openrouter-proxy",
   "displayName": "Cursor OpenRouter Proxy",
   "description": "OpenAI-compatible local proxy for Cursor that translates Anthropic-shape requests to OpenRouter, preserves 1-hour prompt caching, demotes Cursor's background variants, and exposes itself via a cloudflared quick tunnel — with status-bar cost tracking and one-click copy of the public URL.",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "publisher": "ohadbaehr",
   "author": {
     "name": "Ohad Baehr",
@@ -69,6 +69,11 @@
         "command": "cursorProxy.showLogs",
         "title": "Cursor Proxy: Show Logs",
         "category": "Cursor Proxy"
+      },
+      {
+        "command": "cursorProxy.configure",
+        "title": "Cursor Proxy: Open Settings",
+        "category": "Cursor Proxy"
       }
     ],
     "configuration": {
@@ -82,7 +87,19 @@
         "cursorProxy.port": {
           "type": "number",
           "default": 9000,
-          "description": "Local TCP port for the proxy."
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Local TCP port the proxy listens on (127.0.0.1). The first Cursor window to start owns the port; other windows attach to it. Change this if 9000 conflicts with another tool. Reload required."
+        },
+        "cursorProxy.disableTunnel": {
+          "type": "boolean",
+          "default": false,
+          "description": "Don't spawn cloudflared. The proxy still serves on 127.0.0.1:<port> for use with your own tunnel solution (ngrok, Tailscale Funnel, port-forward, etc.)."
+        },
+        "cursorProxy.cloudflaredPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the cloudflared binary. Leave empty to auto-discover via PATH and well-known install locations. Set this if you've installed cloudflared somewhere unusual."
         },
         "cursorProxy.backgroundFallbackModel": {
           "type": "string",
