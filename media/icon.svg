@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f2937"/>
+      <stop offset="1" stop-color="#0b1220"/>
+    </linearGradient>
+    <linearGradient id="stroke" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+  </defs>
+
+  <!-- background -->
+  <rect width="128" height="128" rx="24" fill="url(#bg)"/>
+
+  <!-- ring (the "tunnel") -->
+  <circle cx="64" cy="64" r="40" fill="none" stroke="url(#stroke)" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- routed arrow: enters left, kinks at center, exits right -->
+  <path
+    d="M 22 64 L 50 64 L 60 50 L 78 78 L 106 64"
+    fill="none"
+    stroke="#f8fafc"
+    stroke-width="6"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+
+  <!-- arrowhead -->
+  <path d="M 100 58 L 110 64 L 100 70 Z" fill="#f8fafc"/>
+</svg>

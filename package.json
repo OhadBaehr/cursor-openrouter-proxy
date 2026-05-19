@@ -1,0 +1,135 @@
+{
+  "name": "cursor-openrouter-proxy",
+  "displayName": "Cursor OpenRouter Proxy",
+  "description": "OpenAI-compatible local proxy for Cursor that translates Anthropic-shape requests to OpenRouter, preserves 1-hour prompt caching, demotes Cursor's background variants, and exposes itself via a cloudflared quick tunnel — with status-bar cost tracking and one-click copy of the public URL.",
+  "version": "0.1.0",
+  "publisher": "ohadbaehr",
+  "author": {
+    "name": "Ohad Baehr",
+    "url": "https://github.com/OhadBaehr"
+  },
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#0b1220",
+    "theme": "dark"
+  },
+  "homepage": "https://github.com/OhadBaehr/cursor-openrouter-proxy#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OhadBaehr/cursor-openrouter-proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/OhadBaehr/cursor-openrouter-proxy/issues"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Other"
+  ],
+  "keywords": [
+    "cursor",
+    "openrouter",
+    "anthropic",
+    "claude",
+    "proxy",
+    "prompt-caching",
+    "cloudflared",
+    "ai"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "cursorProxy.menu",
+        "title": "Cursor Proxy: Show Menu",
+        "category": "Cursor Proxy"
+      },
+      {
+        "command": "cursorProxy.toggle",
+        "title": "Cursor Proxy: Toggle On/Off",
+        "category": "Cursor Proxy"
+      },
+      {
+        "command": "cursorProxy.refresh",
+        "title": "Cursor Proxy: Refresh Tunnel URL",
+        "category": "Cursor Proxy"
+      },
+      {
+        "command": "cursorProxy.copyUrl",
+        "title": "Cursor Proxy: Copy URL & Open Models Settings",
+        "category": "Cursor Proxy"
+      },
+      {
+        "command": "cursorProxy.showLogs",
+        "title": "Cursor Proxy: Show Logs",
+        "category": "Cursor Proxy"
+      }
+    ],
+    "configuration": {
+      "title": "Cursor Proxy",
+      "properties": {
+        "cursorProxy.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start the proxy + tunnel automatically when Cursor launches."
+        },
+        "cursorProxy.port": {
+          "type": "number",
+          "default": 9000,
+          "description": "Local TCP port for the proxy."
+        },
+        "cursorProxy.backgroundFallbackModel": {
+          "type": "string",
+          "default": "anthropic/claude-3.5-haiku",
+          "description": "Cheap model used for Cursor's background (thinking/xhigh) variants that OpenRouter doesn't recognize."
+        },
+        "cursorProxy.minMaxTokens": {
+          "type": "number",
+          "default": 16384,
+          "description": "Raise Cursor's max_tokens floor to avoid truncated tool-call JSON."
+        },
+        "cursorProxy.use1hCache": {
+          "type": "boolean",
+          "default": true,
+          "description": "Upgrade ephemeral cache_control to Anthropic's 1-hour TTL beta. 2× write cost, but survives idle gaps."
+        },
+        "cursorProxy.pinAnthropic": {
+          "type": "boolean",
+          "default": true,
+          "description": "Pin OpenRouter routing to anthropic-direct so prompt caches persist across turns."
+        },
+        "cursorProxy.attributionReferer": {
+          "type": "string",
+          "default": "",
+          "description": "Optional value sent as the OpenRouter HTTP-Referer attribution header. Leave empty to use a generic project identifier (default). Set to your own URL only if you actively want your traffic attributed to it on OpenRouter's public leaderboard."
+        },
+        "cursorProxy.attributionTitle": {
+          "type": "string",
+          "default": "",
+          "description": "Optional value sent as the OpenRouter X-Title attribution header. Leave empty to use \"Cursor Proxy\" (default)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --platform=node --target=node18 --format=cjs --minify",
+    "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --platform=node --target=node18 --format=cjs --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "package": "vsce package --no-dependencies --out cursor-openrouter-proxy.vsix",
+    "publish": "vsce publish --no-dependencies",
+    "vscode:prepublish": "npm run typecheck && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.9.1",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.5.0"
+  }
+}

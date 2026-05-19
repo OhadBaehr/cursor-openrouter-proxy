@@ -1,0 +1,570 @@
+import * as vscode from "vscode";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
+import { startProxyServer, ProxyServer, UsageEvent } from "./proxyServer";
+import { Tunnel } from "./tunnel";
+
+let outputChannel: vscode.OutputChannel;
+const LOG_FILE = path.join(os.tmpdir(), "cursor-proxy.log");
+let statusBarItem: vscode.StatusBarItem;
+let proxy: ProxyServer | null = null;
+let tunnel: Tunnel | null = null;
+let currentUrl: string | null = null;
+let acknowledgedUrl: string | null = null;
+let lastUsage: UsageEvent | null = null;
+let enabled = false;
+let starting = false;
+let ctxRef: vscode.ExtensionContext | null = null;
+
+// Cumulative cost for the active tunnel. Resets only on URL change or stop.
+let tunnelCostUrl: string | null = null;
+let tunnelCostTotal = 0;
+let tunnelRequestCount = 0;
+
+const ACK_KEY = "cursorProxy.acknowledgedUrl";
+
+// process.kill(pid,0) catches a dead process but not a dead edge connection,
+// which is the common laptop-sleep failure. Poll the public URL instead.
+const HEALTH_INTERVAL_MS = 30_000;
+const HEALTH_TIMEOUT_MS = 8_000;
+const HEALTH_MAX_FAILURES = 2;
+let healthTimer: NodeJS.Timeout | null = null;
+let healthFailures = 0;
+let healthInFlight = false;
+
+function log(line: string) {
+  const ts = new Date().toISOString().split("T")[1].slice(0, 12);
+  const msg = `${ts} ${line}`;
+  outputChannel.appendLine(msg);
+  try {
+    fs.appendFileSync(LOG_FILE, msg + "\n");
+  } catch {
+    /* ignore */
+  }
+}
+
+async function setAcknowledged(url: string | null) {
+  acknowledgedUrl = url;
+  try {
+    await ctxRef?.globalState.update(ACK_KEY, url);
+  } catch (e) {
+    log(`[ack] persist failed: ${(e as Error).message}`);
+  }
+}
+
+function refreshStatusBar() {
+  if (!enabled) {
+    statusBarItem.text = "$(plug) Proxy: off";
+    statusBarItem.tooltip = "Cursor proxy is off. Click to start.";
+    statusBarItem.backgroundColor = undefined;
+    return;
+  }
+  if (starting) {
+    statusBarItem.text = "$(sync~spin) Proxy: starting…";
+    statusBarItem.tooltip = "Cursor proxy is starting…";
+    statusBarItem.backgroundColor = undefined;
+    return;
+  }
+  if (!currentUrl) {
+    statusBarItem.text = "$(alert) Proxy: tunnel down";
+    statusBarItem.tooltip =
+      "Cloudflared tunnel is not running.\nClick for actions.";
+    statusBarItem.backgroundColor = new vscode.ThemeColor(
+      "statusBarItem.warningBackground"
+    );
+    return;
+  }
+  if (currentUrl !== acknowledgedUrl) {
+    statusBarItem.text = "$(alert) Proxy: new URL";
+    statusBarItem.tooltip =
+      `Tunnel URL is now ${currentUrl}/v1.\n` +
+      `Click → "Copy URL & Open Models Settings".\n` +
+      `Paste into "Override OpenAI Base URL".`;
+    statusBarItem.backgroundColor = new vscode.ThemeColor(
+      "statusBarItem.warningBackground"
+    );
+    return;
+  }
+  const totalStr =
+    tunnelRequestCount > 0 ? ` · $${formatCost(tunnelCostTotal)}` : "";
+  statusBarItem.text = `$(globe) Proxy: on${totalStr}`;
+  statusBarItem.tooltip =
+    `Cursor proxy on.\n` +
+    `Base URL: ${currentUrl}/v1\n` +
+    (tunnelRequestCount > 0
+      ? `Tunnel total: $${tunnelCostTotal.toFixed(4)} across ${tunnelRequestCount} request${tunnelRequestCount === 1 ? "" : "s"}\n`
+      : "") +
+    (lastUsage
+      ? `Last turn: ${lastUsage.model} cached=${pct(lastUsage)}% cost=$${lastUsage.cost.toFixed(4)}`
+      : `No traffic yet.`) +
+    `\nClick for actions (copy URL, refresh, stop, logs).`;
+  statusBarItem.backgroundColor = undefined;
+}
+
+function formatCost(c: number): string {
+  return c >= 1 ? c.toFixed(2) : c.toFixed(4);
+}
+
+function pct(u: UsageEvent): string {
+  const total = u.input + u.cacheCreate + u.cacheRead;
+  if (total <= 0) return "0";
+  return ((100 * u.cacheRead) / total).toFixed(0);
+}
+
+function applyUrl(url: string) {
+  log(`[tunnel] URL: ${url}`);
+  currentUrl = url;
+  if (tunnelCostUrl !== url) {
+    if (tunnelCostUrl !== null) {
+      log(
+        `[tunnel] URL changed (${tunnelCostUrl} → ${url}); resetting tunnel cost total`
+      );
+    }
+    tunnelCostUrl = url;
+    tunnelCostTotal = 0;
+    tunnelRequestCount = 0;
+  }
+  healthFailures = 0;
+  refreshStatusBar();
+  startHealthCheck();
+}
+
+function startHealthCheck() {
+  stopHealthCheck();
+  setTimeout(() => void runHealthProbe("startup"), 2_000);
+  healthTimer = setInterval(
+    () => void runHealthProbe("interval"),
+    HEALTH_INTERVAL_MS
+  );
+}
+
+function stopHealthCheck() {
+  if (healthTimer) {
+    clearInterval(healthTimer);
+    healthTimer = null;
+  }
+  healthFailures = 0;
+}
+
+async function runHealthProbe(reason: string): Promise<void> {
+  if (!enabled || !currentUrl) return;
+  if (healthInFlight) return;
+  const probedUrl = currentUrl;
+  const target = `${probedUrl}/health`;
+  healthInFlight = true;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), HEALTH_TIMEOUT_MS);
+  let ok = false;
+  let detail = "";
+  try {
+    const res = await fetch(target, {
+      method: "GET",
+      signal: ctrl.signal,
+      headers: { "User-Agent": "cursor-proxy-healthcheck/1" },
+    });
+    ok = res.ok;
+    detail = `HTTP ${res.status}`;
+  } catch (e) {
+    detail = (e as Error).name === "AbortError" ? "timeout" : (e as Error).message;
+  } finally {
+    clearTimeout(timer);
+    healthInFlight = false;
+  }
+
+  // Ignore probe results for a URL we no longer hold.
+  if (probedUrl !== currentUrl) return;
+
+  if (ok) {
+    if (healthFailures > 0) {
+      log(`[health] ${target} recovered after ${healthFailures} failures`);
+    }
+    healthFailures = 0;
+    return;
+  }
+
+  healthFailures += 1;
+  log(
+    `[health] ${target} unhealthy (${detail}) ${healthFailures}/${HEALTH_MAX_FAILURES} reason=${reason}`
+  );
+  if (healthFailures < HEALTH_MAX_FAILURES) return;
+
+  log("[health] tunnel unreachable — forcing refresh");
+  healthFailures = 0;
+  currentUrl = null;
+  refreshStatusBar();
+  refresh().catch((e) =>
+    log(`[health] refresh threw: ${(e as Error).message}`)
+  );
+}
+
+async function startAll(): Promise<void> {
+  if (enabled || starting) {
+    log(`[startAll] skipped: enabled=${enabled} starting=${starting}`);
+    return;
+  }
+  starting = true;
+  refreshStatusBar();
+  const cfg = vscode.workspace.getConfiguration("cursorProxy");
+  const port = cfg.get<number>("port", 9000);
+  log(`[startAll] port=${port}`);
+
+  try {
+    proxy = await startProxyServer({
+      port,
+      log,
+      backgroundFallbackModel: cfg.get<string>(
+        "backgroundFallbackModel",
+        "anthropic/claude-3.5-haiku"
+      ),
+      minMaxTokens: cfg.get<number>("minMaxTokens", 16384),
+      use1hCache: cfg.get<boolean>("use1hCache", true),
+      pinAnthropic: cfg.get<boolean>("pinAnthropic", true),
+      referer: cfg.get<string>("attributionReferer", ""),
+      appTitle: cfg.get<string>("attributionTitle", ""),
+    });
+    log(`[startAll] proxy server listening on 127.0.0.1:${port}`);
+    proxy.onUsage((u) => {
+      lastUsage = u;
+      if (currentUrl && tunnelCostUrl === currentUrl) {
+        tunnelCostTotal += u.cost;
+        tunnelRequestCount += 1;
+      }
+      refreshStatusBar();
+    });
+  } catch (e) {
+    const msg = (e as Error).message;
+    log(`[proxy] failed to start: ${msg}`);
+    vscode.window.showErrorMessage(
+      `Cursor proxy: could not bind 127.0.0.1:${port}. ${msg}`
+    );
+    starting = false;
+    refreshStatusBar();
+    return;
+  }
+
+  tunnel = new Tunnel({
+    port,
+    log,
+    onUrl: (url) => applyUrl(url),
+    onExit: () => {
+      if (!enabled || !tunnel) return;
+      log("[tunnel] cloudflared died");
+      currentUrl = null;
+      stopHealthCheck();
+      refreshStatusBar();
+      log("[tunnel] respawning in 2s…");
+      setTimeout(() => {
+        if (enabled && tunnel) tunnel.start();
+      }, 2000);
+    },
+  });
+  if (!tunnel.start()) {
+    log("[startAll] tunnel.start() returned false (cloudflared missing?)");
+    vscode.window.showErrorMessage(
+      "Cursor proxy: cloudflared not found. Install via `brew install cloudflared`."
+    );
+    await proxy?.close();
+    proxy = null;
+    tunnel = null;
+    starting = false;
+    refreshStatusBar();
+    return;
+  }
+  log("[startAll] cloudflared spawned; waiting for URL…");
+  enabled = true;
+  starting = false;
+  refreshStatusBar();
+}
+
+async function stopAll(): Promise<void> {
+  if (!enabled && !starting) return;
+  log("[proxy] disabling…");
+  stopHealthCheck();
+  tunnel?.stop();
+  tunnel = null;
+  await proxy?.close();
+  proxy = null;
+  enabled = false;
+  starting = false;
+  currentUrl = null;
+  tunnelCostUrl = null;
+  tunnelCostTotal = 0;
+  tunnelRequestCount = 0;
+  refreshStatusBar();
+}
+
+// Release handles without killing cloudflared, so the next activation can
+// adopt the same tunnel and the URL doesn't rotate on every reload.
+async function detachAll(): Promise<void> {
+  log("[deactivate] detaching tunnel (cloudflared keeps running)");
+  stopHealthCheck();
+  tunnel?.detach();
+  tunnel = null;
+  await proxy?.close();
+  proxy = null;
+}
+
+// Copy the current URL to clipboard, jump to Cursor's Models settings page,
+// and mark the URL as acknowledged so the status bar stops nagging.
+async function applyCurrentUrl() {
+  if (!currentUrl) return;
+  const baseUrl = `${currentUrl}/v1`;
+  await vscode.env.clipboard.writeText(baseUrl);
+  await setAcknowledged(currentUrl);
+  try {
+    await vscode.commands.executeCommand("aiSettings.action.open", "models");
+  } catch (e) {
+    log(`[apply] aiSettings.action.open failed: ${(e as Error).message}`);
+    // aiSettings.action.open is Cursor-only; degrade to stock VS Code's
+    // settings command.
+    try {
+      await vscode.commands.executeCommand("workbench.action.openSettings");
+    } catch {
+      /* ignore */
+    }
+  }
+  vscode.window.showInformationMessage(
+    `Copied ${baseUrl} to clipboard. Paste it into "Override OpenAI Base URL" on the Models page.`
+  );
+  refreshStatusBar();
+}
+
+async function toggle() {
+  try {
+    if (enabled || starting) {
+      log("[toggle] on → stopAll");
+      await stopAll();
+    } else {
+      log("[toggle] off → startAll");
+      await startAll();
+    }
+  } catch (e) {
+    log(`[toggle] threw: ${(e as Error).stack ?? (e as Error).message}`);
+    vscode.window.showErrorMessage(
+      `Cursor proxy toggle failed: ${(e as Error).message}`
+    );
+  }
+}
+
+async function showMenu() {
+  if (!enabled && !starting) {
+    log("[menu] off → startAll");
+    await startAll();
+    return;
+  }
+  type MenuItem = vscode.QuickPickItem & { id: string };
+  const items: MenuItem[] = [];
+
+  if (currentUrl) {
+    const isNew = currentUrl !== acknowledgedUrl;
+    items.push({
+      id: "copyUrl",
+      label: `$(clippy) Copy URL & Open Models Settings${isNew ? " (new URL)" : ""}`,
+      description: `${currentUrl}/v1`,
+    });
+  } else {
+    items.push({
+      id: "refresh",
+      label: "$(refresh) Restart Tunnel",
+      description: "Cloudflared is not running",
+    });
+  }
+  if (currentUrl) {
+    items.push({
+      id: "refresh",
+      label: "$(refresh) Refresh Tunnel URL",
+      description: "Kill cloudflared and get a new URL",
+    });
+  }
+  items.push({
+    id: "showLogs",
+    label: "$(output) Show Logs",
+  });
+  items.push({
+    id: "stop",
+    label: "$(circle-slash) Stop Proxy",
+  });
+
+  const placeHolder = starting
+    ? "Cursor Proxy: starting…"
+    : currentUrl
+      ? `Cursor Proxy: ${currentUrl}/v1`
+      : "Cursor Proxy: tunnel down";
+
+  const picked = await vscode.window.showQuickPick(items, { placeHolder });
+  if (!picked) return;
+  switch (picked.id) {
+    case "copyUrl":
+      await applyCurrentUrl();
+      break;
+    case "refresh":
+      await refresh();
+      break;
+    case "showLogs":
+      outputChannel.show();
+      break;
+    case "stop":
+      await stopAll();
+      break;
+  }
+}
+
+async function refresh() {
+  if (!enabled || !tunnel) {
+    await startAll();
+    return;
+  }
+  log("[tunnel] manual refresh — killing cloudflared");
+  stopHealthCheck();
+  tunnel.stop();
+  currentUrl = null;
+  refreshStatusBar();
+  // let SIGTERM land before respawn
+  await new Promise((r) => setTimeout(r, 500));
+  tunnel = new Tunnel({
+    port: proxy!.port,
+    log,
+    onUrl: (url) => applyUrl(url),
+    onExit: () => {
+      if (!enabled || !tunnel) return;
+      log("[tunnel] cloudflared died");
+      currentUrl = null;
+      stopHealthCheck();
+      refreshStatusBar();
+      log("[tunnel] respawning in 2s…");
+      setTimeout(() => {
+        if (enabled && tunnel) tunnel.start();
+      }, 2000);
+    },
+  });
+  tunnel.start();
+}
+
+// Sweep state left behind by a pre-release pinner daemon, in case anyone
+// upgrades from a development build.
+function killLegacyPinner() {
+  const stateDir = path.join(os.tmpdir(), "cursor-proxy");
+  const pidFile = path.join(stateDir, "pinner.pid");
+  const targetFile = path.join(stateDir, "pin-target.json");
+  const scriptFile = path.join(stateDir, "pinner.js");
+  const logFile = path.join(stateDir, "pinner.log");
+
+  try {
+    if (fs.existsSync(targetFile)) {
+      fs.writeFileSync(
+        targetFile,
+        JSON.stringify({ stop: true, updatedAt: Date.now() })
+      );
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    const pid = parseInt(fs.readFileSync(pidFile, "utf8"), 10);
+    if (Number.isFinite(pid) && pid > 0) {
+      try {
+        process.kill(pid, 0);
+        log(`[upgrade] killing legacy pinner pid=${pid}`);
+        try {
+          process.kill(pid, "SIGTERM");
+        } catch {
+          /* already gone */
+        }
+      } catch {
+        /* not alive */
+      }
+    }
+  } catch {
+    /* no pid file */
+  }
+  for (const f of [pidFile, targetFile, scriptFile, logFile]) {
+    try {
+      fs.unlinkSync(f);
+    } catch {
+      /* missing is fine */
+    }
+  }
+}
+
+export async function activate(ctx: vscode.ExtensionContext) {
+  ctxRef = ctx;
+  try {
+    fs.writeFileSync(
+      LOG_FILE,
+      `=== activate ${new Date().toISOString()} pid=${process.pid} ===\n`
+    );
+  } catch (e) {
+    try {
+      fs.appendFileSync(
+        path.join(os.homedir(), ".cursor-proxy.boot.log"),
+        `boot ${new Date().toISOString()} writeFile-err: ${(e as Error).message}\n`
+      );
+    } catch {
+      /* truly nothing we can do */
+    }
+  }
+  outputChannel = vscode.window.createOutputChannel("Cursor Proxy");
+  ctx.subscriptions.push(outputChannel);
+  log(`[boot] extension activated, log file: ${LOG_FILE}`);
+
+  acknowledgedUrl = ctx.globalState.get<string>(ACK_KEY, "") || null;
+  log(`[boot] acknowledgedUrl=${acknowledgedUrl ?? "<none>"}`);
+
+  killLegacyPinner();
+
+  statusBarItem = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Right,
+    100
+  );
+  statusBarItem.command = "cursorProxy.menu";
+  statusBarItem.show();
+  ctx.subscriptions.push(statusBarItem);
+
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand("cursorProxy.menu", showMenu),
+    vscode.commands.registerCommand("cursorProxy.toggle", toggle),
+    vscode.commands.registerCommand("cursorProxy.refresh", refresh),
+    vscode.commands.registerCommand("cursorProxy.copyUrl", async () => {
+      if (!currentUrl) {
+        vscode.window.showWarningMessage(
+          "Cursor proxy: no tunnel URL yet. Wait for the tunnel to come up."
+        );
+        return;
+      }
+      await applyCurrentUrl();
+    }),
+    vscode.commands.registerCommand("cursorProxy.showLogs", () => {
+      outputChannel.show();
+    })
+  );
+
+  // setInterval doesn't fire reliably during sleep; window focus does.
+  ctx.subscriptions.push(
+    vscode.window.onDidChangeWindowState((state) => {
+      if (!state.focused) return;
+      if (!enabled || !currentUrl) return;
+      void runHealthProbe("focus");
+    })
+  );
+
+  refreshStatusBar();
+
+  const cfg = vscode.workspace.getConfiguration("cursorProxy");
+  if (cfg.get<boolean>("autoStart", true)) {
+    log("[boot] autoStart=true → starting proxy");
+    try {
+      await startAll();
+    } catch (e) {
+      log(
+        `[boot] startAll threw: ${(e as Error).stack ?? (e as Error).message}`
+      );
+    }
+  } else {
+    log("[boot] autoStart=false; user must click status bar to start");
+  }
+}
+
+export async function deactivate() {
+  await detachAll();
+}
